@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 
 from typing import List, Dict
@@ -127,11 +128,15 @@ def display_actions(actions):
 
 
 class PartToWholeParser(BaseParser):
+    engine = None  # Store engine as class variable for use in static methods
+    
     @classmethod
     def initialize(
         cls,
         engine: str,
     ):
+        cls.engine = engine  # Store engine for recursive query splitting
+        
         @chain
         async def initialize_state(input):
             return PartToWholeParserState(
@@ -218,6 +223,26 @@ class PartToWholeParser(BaseParser):
                     keep_indentation=True,
                 )
 
+        cls.is_query_simple_chain = llm_generation_chain(
+            template_file="is_query_simple.prompt",
+            engine=engine,
+            max_tokens=50,
+            temperature=0.0,
+            keep_indentation=True,
+        )
+        
+        cls.decompose_query_chain = (
+            llm_generation_chain(
+                template_file="decompose_query.prompt",
+                engine=engine,
+                max_tokens=1000,
+                temperature=0.0,
+                keep_indentation=True,
+                output_json=True
+            )
+            | parse_string_to_json
+        )
+
         # cls.debug_sparql_chain = (
         #     llm_generation_chain(
         #         template_file="sparql_debugger.prompt", engine=engine, max_tokens=1000
@@ -235,6 +260,170 @@ class PartToWholeParser(BaseParser):
     @staticmethod
     def get_current_action(state):
         return state["actions"][-1]
+    
+    @staticmethod
+    async def is_query_simple(sparql: str, question: str) -> bool:
+        """
+        Determine if a SPARQL query is simple enough to execute directly.
+        
+        Args:
+            sparql: SPARQL query string
+            question: Original question
+            
+        Returns:
+            True if query is simple, False if it needs decomposition
+        """
+        if not PartToWholeParser.engine:
+            # If engine not initialized, default to simple (no recursive splitting)
+            return True
+            
+        try:
+            response = await PartToWholeParser.is_query_simple_chain.ainvoke({
+                "sparql": sparql,
+                "question": question
+            })
+            return response.strip().upper() == 'SIMPLE'
+        except Exception as e:
+            logger.warning(f"Error checking query simplicity: {e}. Defaulting to simple.")
+            return True
+    
+    @staticmethod
+    async def decompose_query(sparql: str, question: str) -> dict:
+        """
+        Decompose a complex SPARQL query into simpler sub-queries.
+        
+        Args:
+            sparql: Complex SPARQL query
+            question: Original question
+            
+        Returns:
+            Dictionary with 'sub_query', 'final_query', and 'explanation'
+        """
+        if not PartToWholeParser.engine:
+            raise ValueError("Parser not initialized. Call initialize() first.")
+            
+        try:
+            decomposition = await PartToWholeParser.decompose_query_chain.ainvoke({
+                "sparql": sparql,
+                "question": question
+            })
+            return decomposition
+        except Exception as e:
+            logger.error(f"Error decomposing query: {e}")
+            raise ValueError(f"Failed to decompose query: {e}")
+    
+    @staticmethod
+    async def solve_query_recursively(sparql: str, question: str, depth: int = 0, max_depth: int = 5) -> SparqlQuery:
+        """
+        Recursively solve a SPARQL query by splitting it into simpler sub-queries if needed.
+        
+        Args:
+            sparql: SPARQL query to solve
+            question: Original question
+            depth: Current recursion depth
+            max_depth: Maximum recursion depth
+            
+        Returns:
+            SparqlQuery object with execution results
+        """
+        # TODO: This is optional, we can remove it if we want or tinker with max depth.
+        if depth >= max_depth:
+            logger.warning(f"Max recursion depth ({max_depth}) reached. Executing query directly.")
+            sparql_obj = PartToWholeParser.sparql_chain.invoke(sparql)
+            return sparql_obj
+        
+        is_simple = await PartToWholeParser.is_query_simple(sparql, question)
+        
+        if is_simple:
+            # Execute the query directly
+            logger.info(f"{'  ' * depth}Query is simple (depth {depth}), executing directly...")
+            sparql_obj = PartToWholeParser.sparql_chain.invoke(sparql)
+            return sparql_obj
+        else:
+            # Decompose the query
+            logger.info(f"{'  ' * depth}Query is complex (depth {depth}), decomposing...")
+            decomposition = await PartToWholeParser.decompose_query(sparql, question)
+            
+            sub_query = decomposition.get('sub_query', '')
+            final_query = decomposition.get('final_query', '')
+            
+            if not sub_query or not final_query:
+                logger.warning("Decomposition failed to produce valid queries. Executing original query directly.")
+                sparql_obj = PartToWholeParser.sparql_chain.invoke(sparql)
+                return sparql_obj
+            
+            # Execute the sub-query
+            logger.info(f"{'  ' * depth}Executing sub-query...")
+            sub_sparql_obj = await PartToWholeParser.solve_query_recursively(
+                sub_query, question, depth + 1, max_depth
+            )
+            
+            if not sub_sparql_obj.has_results():
+                logger.warning(f"{'  ' * depth}Sub-query returned no results. Returning empty result.")
+                return sub_sparql_obj
+            
+            # Incorporate intermediate results into final query using VALUES clause
+            # Extract the results from sub-query
+            intermediate_results = sub_sparql_obj.execution_result
+            
+            # Build VALUES clause from intermediate results
+            if isinstance(intermediate_results, list) and len(intermediate_results) > 0:
+                # Get the first variable from the results
+                first_result = intermediate_results[0]
+                if isinstance(first_result, dict):
+                    # Find the main variable (usually the first one that's not a label)
+                    main_var = None
+                    for key in first_result.keys():
+                        if not key.endswith('Label') and not key.endswith('label'):
+                            main_var = key
+                            break
+                    
+                    if main_var:
+                        # Build VALUES clause
+                        values_clause = "VALUES ?intermediate_result {\n"
+                        # TODO: Is this limit causing decreases in classification accuracy?
+                        for result in intermediate_results[:100]:  # Limit to 100 values
+                            value = result.get(main_var, {}).get('value', '')
+                            if value:
+                                # Extract QID or value from URI if needed
+                                if 'Q' in value or 'P' in value:
+                                    # Extract QID/PID
+                                    match = re.search(r'(Q\d+|P\d+)', value)
+                                    if match:
+                                        values_clause += f"  wd:{match.group(1)}\n"
+                                else:
+                                    values_clause += f'  "{value}"\n'
+                        values_clause += "}"
+                        
+                        # Insert VALUES clause into final query
+                        # Try to insert after WHERE or before the main WHERE block
+                        if "WHERE" in final_query.upper():
+                            # Insert VALUES before WHERE
+                            where_pos = final_query.upper().find("WHERE")
+                            final_query_with_values = (
+                                final_query[:where_pos] + 
+                                values_clause + "\n" + 
+                                final_query[where_pos:]
+                            )
+                        else:
+                            # Append VALUES at the end before any closing brace
+                            final_query_with_values = final_query + "\n" + values_clause
+                        
+                        final_query = final_query_with_values
+                    else:
+                        logger.warning("Could not find main variable in intermediate results. Using original final query.")
+                else:
+                    logger.warning("Intermediate results format not recognized. Using original final query.")
+            else:
+                logger.warning("No intermediate results to incorporate. Using original final query.")
+            
+            # Recursively solve the final query
+            logger.info(f"{'  ' * depth}Executing final query...")
+            final_sparql_obj = await PartToWholeParser.solve_query_recursively(
+                final_query, question, depth + 1, max_depth
+            )
+            
+            return final_sparql_obj
 
     @staticmethod
     async def router(state):
@@ -301,9 +490,22 @@ class PartToWholeParser(BaseParser):
         current_action = PartToWholeParser.get_current_action(state)
         assert current_action.action_name == "execute_sparql"
         # print("executing ", current_action.action_argument)
-        sparql = PartToWholeParser.sparql_chain.invoke(
-            current_action.action_argument
-        )
+        
+        # Use recursive query splitting to solve the query
+        try:
+            sparql = await PartToWholeParser.solve_query_recursively(
+                current_action.action_argument,
+                state["question"],
+                depth=0,
+                max_depth=5
+            )
+        except Exception as e:
+            logger.warning(f"Recursive query splitting failed: {e}. Falling back to direct execution.")
+            # Fallback to direct execution
+            sparql = PartToWholeParser.sparql_chain.invoke(
+                current_action.action_argument
+            )
+        
         current_action.action_argument = (
             sparql.sparql
         )  # update it with the cleaned and optimized SPARQL

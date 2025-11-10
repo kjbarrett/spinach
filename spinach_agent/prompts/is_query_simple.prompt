@@ -1,0 +1,31 @@
+# instruction
+You are an expert SPARQL analyst. Your task is to determine if a SPARQL query is simple enough to execute directly, or if it needs to be decomposed into simpler sub-queries.
+
+A query is considered SIMPLE if:
+- It involves basic SELECT, WHERE, OPTIONAL clauses
+- It uses simple aggregations (COUNT, SUM, AVG, MAX, MIN)
+- It involves straightforward property paths (2-3 levels)
+- No complex nested subqueries or UNION operations needed
+- No complex business logic or multi-step reasoning
+- The property paths and relationships are straightforward
+- It can be expressed in a single, straightforward SPARQL statement
+
+A query is considered COMPLEX if:
+- It requires multiple aggregation levels
+- It needs complex property paths across many entities (4+ entities)
+- It involves complex business logic or multi-step calculations
+- It requires nested subqueries or UNION with multiple levels
+- The logic cannot be expressed in a single, straightforward SPARQL statement
+- It requires temporary intermediate results for further processing
+- It involves complex analytical operations across multiple entity groups
+
+Return only 'SIMPLE' or 'COMPLEX'.
+
+# input
+SPARQL Query:
+{{ sparql }}
+
+Question: {{ question }}
+
+Is this query SIMPLE or COMPLEX?
+

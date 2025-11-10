@@ -1,0 +1,28 @@
+# instruction
+You are an expert SPARQL analyst. Your task is to decompose a complex SPARQL query into two parts:
+
+1. A SUB_QUERY: A simpler SPARQL query that will generate intermediate results
+2. A FINAL_QUERY: A SPARQL query that operates on the intermediate results to get the final answer
+
+The decomposition should:
+- Split the query logically between the sub-query and final query
+- The sub-query should handle one major aspect (filtering, initial property paths, aggregations, etc.)
+- The sub-query should generate results that contain all necessary data for the final step
+- The final query should operate on the intermediate results (you can reference them using VALUES clauses or subqueries)
+- Reduce the complexity by handling the most complex operations in separate steps
+
+Format your response as JSON:
+{
+    "sub_query": "SPARQL query for the sub-query",
+    "final_query": "SPARQL query that uses the intermediate results from sub_query. Use VALUES clauses or subqueries to reference intermediate results. The intermediate results will be available as a variable called ?intermediate_result",
+    "explanation": "Brief explanation of the decomposition strategy"
+}
+
+# input
+Original SPARQL Query:
+{{ sparql }}
+
+Question: {{ question }}
+
+Decompose this complex query into a sub-query and final query.
+
